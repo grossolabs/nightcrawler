@@ -1,0 +1,134 @@
+name: 'Nightcrawler — Headless Coding Agent'
+description: 'Turns labeled GitHub issues into draft PRs by running Claude Code in headless mode on a self-hosted runner.'
+author: 'grossolabs'
+branding:
+  icon: 'moon'
+  color: 'purple'
+
+inputs:
+  issue-number:
+    description: 'GitHub issue number to implement.'
+    required: true
+  use-subscription:
+    description: 'true: use cached `claude /login` credentials on the runner. false: requires ANTHROPIC_API_KEY env on the calling job.'
+    required: false
+    default: 'true'
+  model:
+    description: 'Claude model. Use `sonnet` (default), `opus`, or a full model id like `claude-opus-4-7`.'
+    required: false
+    default: 'sonnet'
+  max-turns:
+    description: 'Maximum agent turns per attempt before forced stop.'
+    required: false
+    default: '30'
+  max-retries:
+    description: 'How many times to retry the agent if a run produces no changes or fails verification. Each retry resets to the original branch tip via `git reset --hard`.'
+    required: false
+    default: '3'
+  label-progress:
+    description: 'Label applied to the issue while the agent is working.'
+    required: false
+    default: 'nightcrawler:in-progress'
+  label-solved:
+    description: 'Label applied to the issue when the agent opens a PR.'
+    required: false
+    default: 'nightcrawler:solved'
+  label-failed:
+    description: 'Label applied to the issue when the agent gives up.'
+    required: false
+    default: 'nightcrawler:failed'
+  agent-guide-path:
+    description: 'Path inside the consumer repo to the AGENT_GUIDE.md the agent must follow.'
+    required: false
+    default: '.github/AGENT_GUIDE.md'
+  verify-command:
+    description: 'Optional shell command run AFTER the agent finishes and BEFORE the commit. Non-zero exit aborts the commit. Example: `pnpm install --frozen-lockfile && pnpm -r lint:ci && pnpm -r test`.'
+    required: false
+    default: ''
+  branch-prefix:
+    description: 'Prefix for the branch the agent pushes to. The full branch name will be `<prefix><issue-number>-<slug>`.'
+    required: false
+    default: 'agent/issue-'
+  draft-pr:
+    description: 'Open the PR as draft (recommended).'
+    required: false
+    default: 'true'
+  base-branch:
+    description: 'Branch the agent branches off and the PR targets.'
+    required: false
+    default: 'main'
+  allowed-tools:
+    description: 'Comma-separated tool allowlist passed to `claude --allowed-tools`.'
+    required: false
+    default: 'Bash,Read,Write,Edit,Grep,Glob'
+  agent-author-name:
+    description: 'git user.name used for the commit.'
+    required: false
+    default: 'nightcrawler[bot]'
+  agent-author-email:
+    description: 'git user.email used for the commit.'
+    required: false
+    default: 'nightcrawler@users.noreply.github.com'
+
+outputs:
+  branch:
+    description: 'Name of the branch the agent pushed to (empty on no-op).'
+    value: ${{ steps.run.outputs.branch }}
+  pr-url:
+    description: 'URL of the opened PR (empty on no-op or failure before PR open).'
+    value: ${{ steps.run.outputs.pr_url }}
+  status:
+    description: 'success | no-changes | verify-failed | error'
+    value: ${{ steps.run.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Claude Code CLI
+      shell: bash
+      run: |
+        if ! command -v claude >/dev/null 2>&1; then
+          npm install -g @anthropic-ai/claude-code@latest
+        fi
+        claude --version
+
+    - name: Validate auth
+      shell: bash
+      env:
+        USE_SUBSCRIPTION: ${{ inputs.use-subscription }}
+        ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
+      run: |
+        if [ "$USE_SUBSCRIPTION" = "true" ]; then
+          if [ ! -f "$HOME/.claude/.credentials.json" ] && [ ! -f "$HOME/.config/claude/credentials.json" ]; then
+            echo "::error::use-subscription=true but no cached credentials found at \$HOME/.claude/.credentials.json. Run \`sudo -u <runner-user> claude /login\` on the runner once."
+            exit 1
+          fi
+        else
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::use-subscription=false but ANTHROPIC_API_KEY is not set in the calling job's env."
+            exit 1
+          fi
+        fi
+
+    - name: Run agent
+      id: run
+      shell: bash
+      env:
+        ISSUE_NUMBER: ${{ inputs.issue-number }}
+        USE_SUBSCRIPTION: ${{ inputs.use-subscription }}
+        AGENT_MODEL: ${{ inputs.model }}
+        MAX_TURNS: ${{ inputs.max-turns }}
+        MAX_RETRIES: ${{ inputs.max-retries }}
+        AGENT_GUIDE_PATH: ${{ inputs.agent-guide-path }}
+        VERIFY_COMMAND: ${{ inputs.verify-command }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        DRAFT_PR: ${{ inputs.draft-pr }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        ALLOWED_TOOLS: ${{ inputs.allowed-tools }}
+        AGENT_AUTHOR_NAME: ${{ inputs.agent-author-name }}
+        AGENT_AUTHOR_EMAIL: ${{ inputs.agent-author-email }}
+        LABEL_PROGRESS: ${{ inputs.label-progress }}
+        LABEL_SOLVED: ${{ inputs.label-solved }}
+        LABEL_FAILED: ${{ inputs.label-failed }}
+        GH_TOKEN: ${{ github.token }}
+      run: bash ${{ github.action_path }}/scripts/run-agent.sh

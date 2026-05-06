@@ -1,0 +1,64 @@
+# Example: drop this file at .github/workflows/agent.yml in any consumer repo.
+#
+# Triggers the nightcrawler coding agent whenever an issue is labeled
+# `agent-ready` (or whatever label you choose). The agent runs on a
+# self-hosted runner that has Claude Code pre-authed via `claude /login`,
+# implements the issue, runs your verification command, opens a draft PR,
+# and comments on the issue.
+#
+# Setup checklist on the runner VM (one-time):
+#   1. Install Node 24+ and the Claude CLI:
+#        npm install -g @anthropic-ai/claude-code
+#   2. As the runner user, log in interactively:
+#        sudo -u <runner-user> claude /login
+#      Follow the browser flow once. Credentials are cached for headless runs.
+#   3. Make sure `gh` and `jq` are on the PATH.
+
+name: Coding Agent
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  # One agent per issue at a time; multiple issues serialize on the runner.
+  group: nightcrawler-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    if: github.event.label.name == 'agent-ready'
+    runs-on: [self-hosted, linux, gcp]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # we branch from main; need full history
+
+      - name: Setup pnpm + node (consumer-specific — adjust to your stack)
+        uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: 'pnpm'
+
+      - name: Run nightcrawler
+        uses: grossolabs/nightcrawler@v1
+        with:
+          issue-number: ${{ github.event.issue.number }}
+          use-subscription: 'true'
+          model: 'sonnet'                      # or 'opus' for hard issues
+          max-turns: '30'
+          max-retries: '3'
+          agent-guide-path: '.github/AGENT_GUIDE.md'
+          verify-command: |
+            pnpm install --frozen-lockfile
+            pnpm -r --if-present build
+            pnpm -r --if-present lint:ci
+            pnpm -r --if-present test
