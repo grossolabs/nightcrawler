@@ -10,7 +10,7 @@ inputs:
     description: 'GitHub issue number to implement.'
     required: true
   use-subscription:
-    description: 'true: use cached `claude /login` credentials on the runner. false: requires ANTHROPIC_API_KEY env on the calling job.'
+    description: 'true: bill against a Claude Max subscription. Auth via `CLAUDE_CODE_OAUTH_TOKEN` env (preferred — long-lived 1-year token from `claude setup-token`) OR cached `claude /login` credentials at $HOME/.claude/.credentials.json (legacy — 1-hour expiry, brittle on headless). false: requires ANTHROPIC_API_KEY env on the calling job (pay-per-token API console billing).'
     required: false
     default: 'true'
   model:
@@ -97,10 +97,15 @@ runs:
       env:
         USE_SUBSCRIPTION: ${{ inputs.use-subscription }}
         ANTHROPIC_API_KEY: ${{ env.ANTHROPIC_API_KEY }}
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ env.CLAUDE_CODE_OAUTH_TOKEN }}
       run: |
         if [ "$USE_SUBSCRIPTION" = "true" ]; then
-          if [ ! -f "$HOME/.claude/.credentials.json" ] && [ ! -f "$HOME/.config/claude/credentials.json" ]; then
-            echo "::error::use-subscription=true but no cached credentials found at \$HOME/.claude/.credentials.json. Run \`sudo -u <runner-user> claude /login\` on the runner once."
+          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+            echo "Subscription auth via CLAUDE_CODE_OAUTH_TOKEN env (1-year token from \`claude setup-token\`)."
+          elif [ -f "$HOME/.claude/.credentials.json" ] || [ -f "$HOME/.config/claude/credentials.json" ]; then
+            echo "Subscription auth via cached \`claude /login\` credentials. Note: this path expires every ~1h on headless runners; prefer CLAUDE_CODE_OAUTH_TOKEN (\`claude setup-token\`) for CI."
+          else
+            echo "::error::use-subscription=true but neither CLAUDE_CODE_OAUTH_TOKEN env nor cached credentials are present. Run \`claude setup-token\` on a workstation and set the resulting token as CLAUDE_CODE_OAUTH_TOKEN on the runner."
             exit 1
           fi
         else
@@ -131,4 +136,10 @@ runs:
         LABEL_SOLVED: ${{ inputs.label-solved }}
         LABEL_FAILED: ${{ inputs.label-failed }}
         GH_TOKEN: ${{ github.token }}
+        # Claude Code reads CLAUDE_CODE_OAUTH_TOKEN directly. We pass it
+        # through explicitly so the env propagates from the calling job to
+        # the agent process; otherwise it'd only be present if the runner
+        # process happened to inherit it (which is fragile across step
+        # boundaries in self-hosted setups).
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ env.CLAUDE_CODE_OAUTH_TOKEN }}
       run: bash ${{ github.action_path }}/scripts/run-agent.sh
