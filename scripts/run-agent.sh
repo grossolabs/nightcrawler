@@ -171,15 +171,42 @@ while [ "$attempt" -lt "$MAX_RETRIES" ] && [ "$solved" = false ]; do
   git clean -fd >/dev/null 2>&1
 
   attempt_log="$OUTPUT_DIR/attempt-${attempt}.log"
+  # Claude Code refuses --dangerously-skip-permissions as root (security check added
+  # in recent versions). When running as root (Docker CI runner), delegate to a
+  # throwaway non-root user that has access to the Claude credentials.
+  if [ "$(id -u)" = "0" ]; then
+    useradd -m -s /bin/bash _nc 2>/dev/null || true
+    if [ -d "$HOME/.claude" ]; then
+      cp -rp "$HOME/.claude" /home/_nc/ 2>/dev/null || true
+      chown -R _nc:_nc /home/_nc/.claude 2>/dev/null || true
+    fi
+    _NC_HOME=/home/_nc
+    _NC_ENVS="HOME=${_NC_HOME}"
+    [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && _NC_ENVS="$_NC_ENVS CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}"
+    [ -n "${ANTHROPIC_API_KEY:-}" ]       && _NC_ENVS="$_NC_ENVS ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+    [ -n "${GH_TOKEN:-}" ]                && _NC_ENVS="$_NC_ENVS GH_TOKEN=${GH_TOKEN}"
+  fi
+
   set +e
-  claude \
-    --print \
-    --max-turns "$MAX_TURNS" \
-    --model "$AGENT_MODEL" \
-    --allowed-tools "$ALLOWED_TOOLS" \
-    --dangerously-skip-permissions \
-    --output-format text \
-    "$(cat "$PROMPT_FILE")" 2>&1 | tee "$attempt_log" &
+  if [ "$(id -u)" = "0" ]; then
+    su -s /bin/bash _nc -c "env $_NC_ENVS claude \
+      --print \
+      --max-turns \"$MAX_TURNS\" \
+      --model \"$AGENT_MODEL\" \
+      --allowed-tools \"$ALLOWED_TOOLS\" \
+      --dangerously-skip-permissions \
+      --output-format text \
+      \"$(cat "$PROMPT_FILE")\"" 2>&1 | tee "$attempt_log" &
+  else
+    claude \
+      --print \
+      --max-turns "$MAX_TURNS" \
+      --model "$AGENT_MODEL" \
+      --allowed-tools "$ALLOWED_TOOLS" \
+      --dangerously-skip-permissions \
+      --output-format text \
+      "$(cat "$PROMPT_FILE")" 2>&1 | tee "$attempt_log" &
+  fi
   CHILD_PID=$!
   wait "$CHILD_PID"
   AGENT_EXIT=${PIPESTATUS[0]}
@@ -352,3 +379,4 @@ gh issue edit "$ISSUE_NUMBER" --remove-label "$LABEL_PROGRESS" --add-label "$LAB
 gh issue comment "$ISSUE_NUMBER" --body "✅ **Nightcrawler run complete** (attempt ${attempt}/${MAX_RETRIES}). PR: ${PR_URL}"
 
 emit "success" "$BRANCH" "$PR_URL"
+
