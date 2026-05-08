@@ -37,7 +37,16 @@ PROMPT_FILE="$OUTPUT_DIR/prompt.txt"
 VERIFY_LOG="$OUTPUT_DIR/verify.log"
 
 CHILD_PID=""
+WATCHDOG_PID=""
 START_TS=$(date +%s)
+# id of the rolling status comment posted on the issue. Set by status_init,
+# patched by status_update + the watchdog, finalized by status_finalize.
+ANCHOR_ID=""
+# Path to the in-progress attempt's stdout log. Set inside the retry loop
+# before each `claude --print` invocation so the watchdog can tail it.
+CURRENT_ATTEMPT_LOG=""
+# Mirror of the current attempt counter and ceiling for the watchdog format.
+CURRENT_ATTEMPT=0
 
 emit() {
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
@@ -49,14 +58,141 @@ emit() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Status comment (anchor-edit pattern, per issue grossolabs/serafin#148)
+#
+# Post a single comment on the GitHub issue when nightcrawler claims it,
+# edit it in place every ~30s with a status digest from the running agent's
+# stdout log + git working-tree diff. Finalize on completion (success,
+# blocked, no_code, or failure) and stop editing. Never spawn a second
+# comment per run — the rule is "one anchor edited in place, no comment-
+# per-update spam."
+# ---------------------------------------------------------------------------
+
+# Format the rolling status body. State is one of: STARTED, IN PROGRESS,
+# SOLVED, FAILED, BLOCKED, NO_CODE. attempt + max_attempts are integers.
+# The body is markdown — GitHub renders it in the issue thread.
+status_body() {
+  local state="$1"
+  local attempt="$2"
+  local max_attempts="$3"
+  local extra="${4:-}"
+
+  local now elapsed mm ss
+  now=$(date +%s)
+  elapsed=$((now - START_TS))
+  mm=$((elapsed / 60))
+  ss=$((elapsed % 60))
+
+  local emoji
+  case "$state" in
+    STARTED|"IN PROGRESS") emoji="🤖" ;;
+    SOLVED) emoji="✅" ;;
+    FAILED) emoji="❌" ;;
+    BLOCKED) emoji="⏸️" ;;
+    NO_CODE) emoji="ℹ️" ;;
+    *) emoji="🤖" ;;
+  esac
+
+  local recent_output="(no output yet)"
+  if [ -n "$CURRENT_ATTEMPT_LOG" ] && [ -f "$CURRENT_ATTEMPT_LOG" ]; then
+    # Last 8 non-blank lines of the agent's stdout. Truncate per-line at
+    # 200 chars to keep the comment compact — full logs land in the PR
+    # body's "tail 30 lines" block on success.
+    local tail_lines
+    tail_lines=$(tail -n 40 "$CURRENT_ATTEMPT_LOG" 2>/dev/null \
+      | grep -v '^$' \
+      | tail -n 8 \
+      | awk '{ if (length > 200) print substr($0, 1, 200) "…"; else print }')
+    if [ -n "$tail_lines" ]; then
+      recent_output="$tail_lines"
+    fi
+  fi
+
+  local files_touched="(none yet)"
+  # `git status -s` shows working-tree changes since the agent's checkpoint.
+  # Only meaningful inside the consumer-repo checkout (after step 3 in the
+  # main flow). Suppress errors silently if not a git repo yet.
+  local file_lines
+  file_lines=$(git status -s 2>/dev/null | head -n 12 || true)
+  if [ -n "$file_lines" ]; then
+    files_touched="$file_lines"
+  fi
+
+  cat <<EOF
+${emoji} **Nightcrawler — ${state}**  ·  ${mm}m ${ss}s elapsed  ·  \`${AGENT_MODEL}\`  ·  attempt ${attempt}/${max_attempts}
+
+### Recent output
+\`\`\`
+${recent_output}
+\`\`\`
+
+### Files touched
+\`\`\`
+${files_touched}
+\`\`\`
+${extra}
+EOF
+}
+
+# Post the initial anchor comment. Stores the comment id in ANCHOR_ID for
+# subsequent patches. Failure is non-fatal — if GitHub is having a moment
+# we still want the agent to run.
+status_init() {
+  local body
+  body=$(status_body "STARTED" 1 "$MAX_RETRIES")
+  ANCHOR_ID=$(printf '%s' "$body" \
+    | gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/$ISSUE_NUMBER/comments" \
+        -F body=@- --jq '.id' 2>/dev/null || echo "")
+  if [ -n "$ANCHOR_ID" ]; then
+    echo "Status anchor comment: $ANCHOR_ID"
+  else
+    echo "::warning::Failed to create status anchor comment; status updates will be skipped."
+  fi
+}
+
+# PATCH the anchor comment with a fresh body. Silent on failure — never
+# crash the agent run because GitHub returned a 5xx on a status update.
+status_update() {
+  local state="$1"
+  local extra="${2:-}"
+  if [ -z "$ANCHOR_ID" ]; then return 0; fi
+  local body
+  body=$(status_body "$state" "$CURRENT_ATTEMPT" "$MAX_RETRIES" "$extra")
+  printf '%s' "$body" \
+    | gh api -X PATCH "/repos/$GITHUB_REPOSITORY/issues/comments/$ANCHOR_ID" \
+        -F body=@- >/dev/null 2>&1 || true
+}
+
+# Background watchdog. Polls every 30s and patches the anchor comment with
+# the current state. Started before each `claude --print` invocation,
+# killed when the agent exits.
+status_watchdog() {
+  while sleep 30; do
+    status_update "IN PROGRESS"
+  done
+}
+
 cleanup() {
   local exit_code=$?
+  # Stop the watchdog FIRST so it doesn't race with the finalize patch.
+  if [ -n "$WATCHDOG_PID" ] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
+    kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+    WATCHDOG_PID=""
+  fi
   if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
     kill -TERM "$CHILD_PID" 2>/dev/null || true
     wait "$CHILD_PID" 2>/dev/null || true
   fi
   if [ "$exit_code" -ne 0 ]; then
     gh issue edit "$ISSUE_NUMBER" --remove-label "$LABEL_PROGRESS" 2>/dev/null || true
+    # If we exited unexpectedly (process killed, set -e tripped) AND the
+    # anchor exists but no terminal status was posted, mark it FAILED so
+    # the issue isn't left showing "IN PROGRESS" forever.
+    if [ -n "$ANCHOR_ID" ]; then
+      status_update "FAILED" $'\n'"_(run terminated unexpectedly with exit $exit_code — see workflow logs)_"
+    fi
   fi
 }
 handle_interrupt() {
@@ -87,6 +223,10 @@ echo "::endgroup::"
 ensure_labels
 gh issue edit "$ISSUE_NUMBER" --remove-label "$LABEL_SOLVED" --remove-label "$LABEL_FAILED" 2>/dev/null || true
 gh issue edit "$ISSUE_NUMBER" --add-label "$LABEL_PROGRESS" 2>/dev/null || true
+
+# Post the rolling status anchor comment. From here on, status_update
+# patches the same comment in place — no new comments per state change.
+status_init
 
 # ---------------------------------------------------------------------------
 # 2. Branch name
@@ -164,6 +304,7 @@ last_log=""
 
 while [ "$attempt" -lt "$MAX_RETRIES" ] && [ "$solved" = false ]; do
   attempt=$((attempt + 1))
+  CURRENT_ATTEMPT=$attempt
   echo "::group::Agent run — attempt $attempt of $MAX_RETRIES (model=$AGENT_MODEL, max-turns=$MAX_TURNS)"
 
   # Reset to checkpoint between retries
@@ -171,6 +312,20 @@ while [ "$attempt" -lt "$MAX_RETRIES" ] && [ "$solved" = false ]; do
   git clean -fd >/dev/null 2>&1
 
   attempt_log="$OUTPUT_DIR/attempt-${attempt}.log"
+  CURRENT_ATTEMPT_LOG="$attempt_log"
+  # Make sure the file exists before the watchdog tails it.
+  : > "$attempt_log"
+
+  # Refresh the anchor immediately so the issue shows the new attempt
+  # number even if the watchdog hasn't ticked yet.
+  status_update "IN PROGRESS"
+
+  # Background watchdog patches the anchor every 30s with the latest
+  # tail-of-log + git-status digest. Stopped after `wait $CHILD_PID`
+  # so the post-attempt logic has a stable file system view.
+  status_watchdog &
+  WATCHDOG_PID=$!
+
   # Claude Code refuses --dangerously-skip-permissions as root (security check added
   # in recent versions). When running as root (Docker CI runner), delegate to a
   # throwaway non-root user that has access to the Claude credentials.
@@ -212,6 +367,16 @@ while [ "$attempt" -lt "$MAX_RETRIES" ] && [ "$solved" = false ]; do
   AGENT_EXIT=${PIPESTATUS[0]}
   CHILD_PID=""
   set -e
+
+  # Stop the watchdog before evaluating attempt outcome so the next
+  # status_update we emit (in the success/blocked/no_code finalizers)
+  # races against nothing.
+  if [ -n "$WATCHDOG_PID" ] && kill -0 "$WATCHDOG_PID" 2>/dev/null; then
+    kill -TERM "$WATCHDOG_PID" 2>/dev/null || true
+    wait "$WATCHDOG_PID" 2>/dev/null || true
+  fi
+  WATCHDOG_PID=""
+
   last_log="$attempt_log"
   echo "Agent exit code: $AGENT_EXIT"
   echo "::endgroup::"
@@ -226,14 +391,13 @@ while [ "$attempt" -lt "$MAX_RETRIES" ] && [ "$solved" = false ]; do
     REASON=$(grep -E '^NO_CODE:' "$attempt_log" | head -1 | sed 's/^NO_CODE:[[:space:]]*//')
     echo "::warning::Agent reported NO_CODE: $REASON"
     gh issue edit "$ISSUE_NUMBER" --remove-label "$LABEL_PROGRESS" 2>/dev/null || true
-    gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
-ℹ️ **Nightcrawler:** this issue does not appear to need code changes.
+    status_update "NO_CODE" "$(cat <<EOF
 
-> $REASON
 
-\`\`\`
-$(tail -30 "$attempt_log")
-\`\`\`
+### Reason
+> ${REASON}
+
+This issue does not appear to need code changes.
 EOF
 )"
     emit "no-changes" "$BRANCH" ""
@@ -245,14 +409,13 @@ EOF
     REASON=$(grep -E '^BLOCKED:' "$attempt_log" | head -1 | sed 's/^BLOCKED:[[:space:]]*//')
     echo "::warning::Agent reported BLOCKED: $REASON"
     gh issue edit "$ISSUE_NUMBER" --remove-label "$LABEL_PROGRESS" --add-label "$LABEL_FAILED" 2>/dev/null || true
-    gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
-⏸️ **Nightcrawler aborted:** agent could not satisfy the issue.
+    status_update "BLOCKED" "$(cat <<EOF
 
-> $REASON
 
-\`\`\`
-$(tail -50 "$attempt_log")
-\`\`\`
+### Reason
+> ${REASON}
+
+Agent reported it could not satisfy the issue. Re-label or rewrite the spec to retry.
 EOF
 )"
     emit "no-changes" "$BRANCH" ""
@@ -290,20 +453,19 @@ done
 if [ "$solved" = false ]; then
   echo "::error::Failed after $MAX_RETRIES attempts."
   gh issue edit "$ISSUE_NUMBER" --remove-label "$LABEL_PROGRESS" --add-label "$LABEL_FAILED" 2>/dev/null || true
-  gh issue comment "$ISSUE_NUMBER" --body "$(cat <<EOF
-❌ **Nightcrawler failed** after $MAX_RETRIES attempts.
 
-Last attempt log (tail 80):
-\`\`\`
-$(tail -80 "$last_log")
-\`\`\`
+  # Build the FAILED finalization block. Verification log is included
+  # only when a verify-command was configured AND its log exists.
+  FAIL_EXTRA=$'\n\n### Last attempt log (tail 80)\n```\n'
+  FAIL_EXTRA+="$(tail -n 80 "$last_log" 2>/dev/null || echo '(log unavailable)')"
+  FAIL_EXTRA+=$'\n```'
+  if [ -n "$VERIFY_COMMAND" ] && [ -f "$VERIFY_LOG" ]; then
+    FAIL_EXTRA+=$'\n\n### Verification log (tail 50)\n```\n'
+    FAIL_EXTRA+="$(tail -n 50 "$VERIFY_LOG" 2>/dev/null || echo '(verify log unavailable)')"
+    FAIL_EXTRA+=$'\n```'
+  fi
+  status_update "FAILED" "$FAIL_EXTRA"
 
-$([ -n "$VERIFY_COMMAND" ] && echo "Verification (tail 50):" || echo "")
-$([ -n "$VERIFY_COMMAND" ] && [ -f "$VERIFY_LOG" ] && echo "\`\`\`" || echo "")
-$([ -n "$VERIFY_COMMAND" ] && [ -f "$VERIFY_LOG" ] && tail -50 "$VERIFY_LOG" || echo "")
-$([ -n "$VERIFY_COMMAND" ] && [ -f "$VERIFY_LOG" ] && echo "\`\`\`" || echo "")
-EOF
-)"
   emit "verify-failed" "$BRANCH" ""
   exit 1
 fi
@@ -376,7 +538,22 @@ echo "PR: $PR_URL"
 echo "::endgroup::"
 
 gh issue edit "$ISSUE_NUMBER" --remove-label "$LABEL_PROGRESS" --add-label "$LABEL_SOLVED" 2>/dev/null || true
-gh issue comment "$ISSUE_NUMBER" --body "✅ **Nightcrawler run complete** (attempt ${attempt}/${MAX_RETRIES}). PR: ${PR_URL}"
+
+# Finalize the anchor with PR + run stats. Replaces the previous
+# `gh issue comment "✅ Nightcrawler run complete..."` post — same info,
+# delivered by editing the rolling anchor instead of posting a new
+# comment.
+SUCCESS_EXTRA=$'\n\n### PR\n'"${PR_URL}"
+SUCCESS_EXTRA+=$'\n\n### Agent summary\n'"${final_summary:-_(agent did not emit a SUMMARY: line — see logs)_}"
+SUCCESS_EXTRA+=$'\n\n### Run stats\n'
+SUCCESS_EXTRA+="- Duration: ${ELAPSED_MIN}m ${ELAPSED_SEC}s"$'\n'
+SUCCESS_EXTRA+="- Attempts: ${attempt}/${MAX_RETRIES}"$'\n'
+if [ -n "$VERIFY_COMMAND" ]; then
+  SUCCESS_EXTRA+="- Verification: ✅ \`${VERIFY_COMMAND}\`"$'\n'
+else
+  SUCCESS_EXTRA+="- Verification: (none configured)"$'\n'
+fi
+status_update "SOLVED" "$SUCCESS_EXTRA"
 
 emit "success" "$BRANCH" "$PR_URL"
 
