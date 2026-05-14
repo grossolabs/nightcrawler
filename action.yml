@@ -69,6 +69,10 @@ inputs:
     description: 'git user.email used for the commit.'
     required: false
     default: 'nightcrawler@users.noreply.github.com'
+  use-bedrock:
+    description: 'Set to true to route Claude requests through AWS Bedrock instead of the Anthropic API. Requires AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION on the runner (set via secrets + env: in the calling job).'
+    required: false
+    default: 'false'
 
 outputs:
   branch:
@@ -106,7 +110,13 @@ runs:
         # works as long as the runner process has it (e.g. via
         # docker-compose env_file on a self-hosted runner).
       run: |
-        if [ "$USE_SUBSCRIPTION" = "true" ]; then
+        if [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::use-bedrock=true but AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY is not set. Pass them via the calling job's env: block (e.g. from secrets)."
+            exit 1
+          fi
+          echo "Bedrock auth via AWS credentials (region: ${AWS_REGION:-us-east-1})."
+        elif [ "$USE_SUBSCRIPTION" = "true" ]; then
           if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
             echo "Subscription auth via CLAUDE_CODE_OAUTH_TOKEN env (1-year token from \`claude setup-token\`)."
           elif [ -f "$HOME/.claude/.credentials.json" ] || [ -f "$HOME/.config/claude/credentials.json" ]; then
@@ -143,8 +153,11 @@ runs:
         LABEL_SOLVED: ${{ inputs.label-solved }}
         LABEL_FAILED: ${{ inputs.label-failed }}
         GH_TOKEN: ${{ github.token }}
-        # CLAUDE_CODE_OAUTH_TOKEN intentionally NOT declared here — see
-        # validate-auth step for the rationale. Bash inherits process env,
-        # so `claude` invoked by run-agent.sh will see the token if it's
-        # present on the runner (e.g. via docker-compose env_file).
+        CLAUDE_CODE_USE_BEDROCK: ${{ inputs.use-bedrock == 'true' && '1' || '' }}
+        # CLAUDE_CODE_OAUTH_TOKEN, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+        # AWS_SESSION_TOKEN, and AWS_REGION are intentionally NOT declared here
+        # — see validate-auth step for the rationale. Bash inherits process env,
+        # so `claude` invoked by run-agent.sh will see them if present on the
+        # runner (e.g. via docker-compose env_file or secrets passed in the
+        # calling job's env: block).
       run: bash ${{ github.action_path }}/scripts/run-agent.sh

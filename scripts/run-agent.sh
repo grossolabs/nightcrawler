@@ -337,9 +337,14 @@ while [ "$attempt" -lt "$MAX_RETRIES" ] && [ "$solved" = false ]; do
     fi
     _NC_HOME=/home/_nc
     _NC_ENVS="HOME=${_NC_HOME}"
-    [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && _NC_ENVS="$_NC_ENVS CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}"
-    [ -n "${ANTHROPIC_API_KEY:-}" ]       && _NC_ENVS="$_NC_ENVS ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
-    [ -n "${GH_TOKEN:-}" ]                && _NC_ENVS="$_NC_ENVS GH_TOKEN=${GH_TOKEN}"
+    [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]  && _NC_ENVS="$_NC_ENVS CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}"
+    [ -n "${ANTHROPIC_API_KEY:-}" ]        && _NC_ENVS="$_NC_ENVS ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
+    [ -n "${GH_TOKEN:-}" ]                 && _NC_ENVS="$_NC_ENVS GH_TOKEN=${GH_TOKEN}"
+    [ -n "${CLAUDE_CODE_USE_BEDROCK:-}" ]  && _NC_ENVS="$_NC_ENVS CLAUDE_CODE_USE_BEDROCK=${CLAUDE_CODE_USE_BEDROCK}"
+    [ -n "${AWS_REGION:-}" ]               && _NC_ENVS="$_NC_ENVS AWS_REGION=${AWS_REGION}"
+    [ -n "${AWS_ACCESS_KEY_ID:-}" ]        && _NC_ENVS="$_NC_ENVS AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}"
+    [ -n "${AWS_SECRET_ACCESS_KEY:-}" ]    && _NC_ENVS="$_NC_ENVS AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}"
+    [ -n "${AWS_SESSION_TOKEN:-}" ]        && _NC_ENVS="$_NC_ENVS AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}"
   fi
 
   set +e
