@@ -100,17 +100,9 @@ runs:
       shell: bash
       env:
         USE_SUBSCRIPTION: ${{ inputs.use-subscription }}
-        # ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are intentionally NOT
-        # declared here. The GH Actions `env` context only contains values
-        # from explicit env: blocks (workflow/job/step) and does NOT
-        # auto-populate from runner process env — `${{ env.X }}` would
-        # resolve to empty strings even when the underlying env var is
-        # present in the container/runner process. Bash steps inherit
-        # process env directly, so reading $CLAUDE_CODE_OAUTH_TOKEN below
-        # works as long as the runner process has it (e.g. via
-        # docker-compose env_file on a self-hosted runner).
+        USE_BEDROCK: ${{ inputs.use-bedrock }}
       run: |
-        if [ "${CLAUDE_CODE_USE_BEDROCK:-}" = "1" ]; then
+        if [ "$USE_BEDROCK" = "true" ] || [ "$USE_BEDROCK" = "1" ]; then
           if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
             echo "::error::use-bedrock=true but AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY is not set. Pass them via the calling job's env: block (e.g. from secrets)."
             exit 1
