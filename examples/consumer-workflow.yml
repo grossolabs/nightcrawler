@@ -2,18 +2,25 @@
 #
 # Triggers the nightcrawler coding agent whenever an issue is labeled
 # `agent-ready` (or whatever label you choose). The agent runs on a
-# self-hosted runner, routes Claude requests through AWS Bedrock, implements
-# the issue, runs your verification command, opens a draft PR, and comments
-# on the issue.
+# self-hosted runner pre-authed against a Claude Max subscription (1-year
+# OAuth token from `claude setup-token`), implements the issue, runs your
+# verification command, opens a draft PR, and comments on the issue.
 #
 # Setup checklist on the runner VM (one-time):
 #   1. Install Node 24+ and the Claude CLI:
 #        npm install -g @anthropic-ai/claude-code
 #   2. Make sure `gh` and `jq` are on the PATH.
-#   3. Add these repository secrets (Settings → Secrets → Actions):
-#        AWS_ACCESS_KEY_ID      — IAM key with bedrock:InvokeModel on Claude models
-#        AWS_SECRET_ACCESS_KEY  — corresponding secret
-#      Optional: AWS_SESSION_TOKEN if using temporary credentials.
+#   3. Mint a long-lived subscription token on a workstation:
+#        claude setup-token
+#      Put the resulting `sk-ant-oat-...` token in the runner process env
+#      as CLAUDE_CODE_OAUTH_TOKEN (e.g. via docker-compose env_file or
+#      systemd EnvironmentFile). The action picks it up automatically —
+#      no workflow-level env: block is needed.
+#
+# Bedrock alternative: if you'd rather bill via AWS Bedrock, set
+# `use-bedrock: 'true'` + `use-subscription: 'false'` on the action and pass
+# AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION via the step's
+# env: block from secrets. See action.yml for details.
 
 name: Coding Agent
 
@@ -51,15 +58,9 @@ jobs:
 
       - name: Run nightcrawler
         uses: grossolabs/nightcrawler@v1
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION: us-east-1                # Bedrock region where Claude models are enabled
-          # AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}  # uncomment for temporary creds
         with:
           issue-number: ${{ github.event.issue.number }}
-          use-bedrock: 'true'
-          use-subscription: 'false'
+          use-subscription: 'true'
           model: 'sonnet'                      # or 'opus' for hard issues
           max-turns: '30'
           max-retries: '3'
