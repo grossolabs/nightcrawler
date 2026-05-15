@@ -2,17 +2,18 @@
 #
 # Triggers the nightcrawler coding agent whenever an issue is labeled
 # `agent-ready` (or whatever label you choose). The agent runs on a
-# self-hosted runner that has Claude Code pre-authed via `claude /login`,
-# implements the issue, runs your verification command, opens a draft PR,
-# and comments on the issue.
+# self-hosted runner, routes Claude requests through AWS Bedrock, implements
+# the issue, runs your verification command, opens a draft PR, and comments
+# on the issue.
 #
 # Setup checklist on the runner VM (one-time):
 #   1. Install Node 24+ and the Claude CLI:
 #        npm install -g @anthropic-ai/claude-code
-#   2. As the runner user, log in interactively:
-#        sudo -u <runner-user> claude /login
-#      Follow the browser flow once. Credentials are cached for headless runs.
-#   3. Make sure `gh` and `jq` are on the PATH.
+#   2. Make sure `gh` and `jq` are on the PATH.
+#   3. Add these repository secrets (Settings → Secrets → Actions):
+#        AWS_ACCESS_KEY_ID      — IAM key with bedrock:InvokeModel on Claude models
+#        AWS_SECRET_ACCESS_KEY  — corresponding secret
+#      Optional: AWS_SESSION_TOKEN if using temporary credentials.
 
 name: Coding Agent
 
@@ -50,9 +51,15 @@ jobs:
 
       - name: Run nightcrawler
         uses: grossolabs/nightcrawler@v1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: us-east-1                # Bedrock region where Claude models are enabled
+          # AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}  # uncomment for temporary creds
         with:
           issue-number: ${{ github.event.issue.number }}
-          use-subscription: 'true'
+          use-bedrock: 'true'
+          use-subscription: 'false'
           model: 'sonnet'                      # or 'opus' for hard issues
           max-turns: '30'
           max-retries: '3'
